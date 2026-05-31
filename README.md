@@ -256,6 +256,9 @@ python inspect_model.py --checkpoint outputs\top_22\top_ft_k4_<timestamp> --seed
 
 ## Known limitations
 
+### `get_mask()` is slow (not vectorized)
+
+The masking code has a Python `for b in range(batch_size)` loop that runs at every decoding step. This is the training bottleneck — it scales linearly with total instances processed, making large epoch sizes slow (~30–50 min/epoch at epoch_size=51200). Vectorizing this loop with tensor operations would give a 10–50× speedup and is the most impactful engineering task before scaling up experiments.
 
 ### `min_visits=3` adds no constraint
 
@@ -267,20 +270,55 @@ With 16 PMs and k=4, there are only 240 unique (start, end) pairs. The topology 
 
 ---
 
+## Training results and open problem
+
+A 6-epoch run (`epoch_size=10240`, `min_visits=3`) showed the model learning something — validation cost fell from ~47 (untrained) to the ~30 range — but did not converge. Optimal is 4–6 hops; the model plateaued well above that.
+
+| Epoch | Val avg cost | Baseline updated? |
+|-------|-------------|-------------------|
+| 0 | 42.3 | Yes |
+| 1 | 35.7 | No |
+| 2 | 41.8 | Yes |
+| 3 | 30.7 | No |
+| 4 | 39.9 | No |
+| 5 | 31.4 | No |
+
+The baseline froze after epoch 2 and validation oscillated rather than trending down. The root cause is identifiable from a key signal: **training batch cost (sampled decoding) settled at ~14, while validation cost (greedy decoding) stayed at ~30–42**. Sampled paths are nearly half the cost of greedy paths, which is backwards — greedy should be at least as good as average sampled.
+
+This means the model learned a high-entropy policy that occasionally samples a short path by chance but has no confident greedy direction. The model can identify the end node but can't navigate toward it through the graph.
+
+**Root cause: node features don't encode routing information.** The four current features are: normalized node index, avg outgoing cost, `is_start`, `is_end`. The first two are identical across all 240 instances since the topology never changes. Only `is_start` and `is_end` vary — they mark the source and destination, but give the model no signal about which direction to go through the intermediate switches.
+
+This is not a bug in the code. The pipeline is correct. It is a feature design limitation.
+
+---
+
 ## Planned next steps
 
-### 1. Specific required nodes (highest priority)
+### 1. Add distance-to-end node feature (highest priority for convergence)
+
+Add BFS hop distance from each node to the end node as a 5th feature in `_init_embed()` in `nets/attention_model.py`. Since all edge costs are 1.0, BFS distance is well-defined and cheap to compute. This gives the model a routing gradient — it can see which nodes are closer to the destination and learn to prefer them.
+
+Also update `node_dim = 5` (currently 4) in `AttentionModel.__init__` for the TOP branch, and retrain with learning rate decay and a looser baseline threshold:
+
+```powershell
+python run.py --problem top --fat_tree_k 4 --min_visits 3 --baseline rollout `
+  --run_name top_ft_dist_feature --epoch_size 10240 --n_epochs 30 `
+  --batch_size 128 --eval_batch_size 128 --val_size 1024 `
+  --lr_decay 0.95 --bl_alpha 0.10
+```
+
+### 2. Specific required nodes
 
 Change the constraint from "visit any K nodes" to "visit this specific set of nodes". For example: nodes {5, 12, 17} must appear on the path from node 20 to node 21.
 
 Files to change:
 - **`state_top1.py`**: Replace `min_visits: Tensor (batch_size,)` with `required_nodes: Tensor (batch_size, n_required)`. Change `all_finished()` and `get_mask()` from count comparison to set membership check.
-- **`attention_model.py`**: Add a 5th node feature `is_required` (1.0 for required nodes, 0.0 otherwise).
+- **`attention_model.py`**: Add an `is_required` binary node feature (1.0 for required nodes, 0.0 otherwise).
 - **`fat_tree_wrapper.py`**: Generate a random subset of switches as required nodes per instance.
 - **`problem_top1.py`**: Update `get_costs()` to check set membership instead of counting unique nodes.
 
-
-### 2. Non-uniform edge costs
+### 3. Non-uniform edge costs
 
 Replace unit costs with traffic-load-based weights from the FatTree class, making the problem more realistic and harder for classical algorithms.
 

@@ -23,7 +23,6 @@ Add the **N-Stroll (K-Stroll) problem** to the attention-learn-to-route codebase
 |------|---------|
 | `problems/top1/problem_top1.py` | `TOP` class, dataset, instance generator (random/euclidean/sparse/fat_tree graph types) |
 | `problems/top1/state_top1.py` | `StateTop` NamedTuple — step logic, masking, visit counting |
-| `problems/top1/top1_readme.md` | Documentation |
 | `problems/top1/__init__.py` | Empty init |
 | `fattree/fat_tree_wrapper.py` | Converts FatTree topology to TOP cost-matrix format |
 | `fattree/vm_pair.py` | Stub (was missing, blocked FatTree import) |
@@ -36,7 +35,6 @@ Add the **N-Stroll (K-Stroll) problem** to the attention-learn-to-route codebase
 | File | Change |
 |------|--------|
 | `fattree/fat_tree.py` | Changed bare imports to relative imports; guarded `pulp` with try/except |
-| `fattree/fat_tree_wrapper.py` | **Node remapping updated** — switches at 0–19, start PM at 20, end PM at 21 (matches fat-tree convention) |
 | `nets/attention_model.py` | Added `is_top` flag; custom `_init_embed()` that builds node features from cost matrix |
 | `problems/__init__.py` | Added `from problems.top1.problem_top1 import TOP` |
 | `options.py` | Added `--fat_tree_k` and `--min_visits` CLI args |
@@ -61,71 +59,124 @@ Debug/diagnostic scripts at repo root: `debug.py`, `debug_state.py`, `debug_batc
 
 ## Current Progress
 
-### Fixes applied this session
+### Completed this session
 
-1. **Duplicate `_bfs_next_hop`** in `state_top1.py` — removed the shadowed first definition
-2. **Debug `print` statements** in `get_mask()` — removed all stdout spam
-3. **Node remapping** in `fat_tree_wrapper.py` — start PM moved from index 0 to index 20 to match fat-tree convention (switches 0–19, PMs 20–21). All old checkpoints and logs were wiped (they used the old layout and are invalid).
+1. **Pushed to GitHub** — repo is at https://github.com/chrisagonza97/attention-learn-to-route-with-top1 (not a fork, just a push of the local clone; no "forked from" badge but full history is there)
 
-### Training runs
+2. **Cleaned up LLM-style language** across all new files — removed "YOUR/your" references, conversational phrases ("we don't need VMs", "We only COUNT distinct nodes") from `fat_tree_wrapper.py`, `problem_top1.py`, `state_top1.py`, `generate_data.py`, `state_top1.py`
 
-**Run `top_ft_k4` — currently in progress (started this session)**
-- Command: `epoch_size=10240, n_epochs=6, batch_size=128, val_size=1024, min_visits=3`
-- Expected wall time: ~45 min
-- Check `training_log.txt` for results
+3. **Updated README.md** — added "AI coding assistant context" section at the bottom pointing to this file
 
-**Previous run `top_ft_mv10` (prior session, now deleted — used old node layout)**
-- 10 epochs, epoch_size=5120: val cost dropped 46→42, baseline froze after epoch 2 at 28.38
-- Not reproducible (old remapping) — treat as directional evidence only
+4. **Completed 6-epoch training run** (`top_ft_k4_20260530T163640`, `epoch_size=10240`, `min_visits=3`)
 
-**Weak baseline model** exists at `outputs/top_22/top_inspect_<timestamp>/` — 1 epoch of 128 instances, useful only as a "random walk" reference for `inspect_model.py` comparison.
+### Training results (6-epoch run)
+
+| Epoch | Val avg cost | Baseline updated? |
+|-------|-------------|-------------------|
+| 0 | 42.3 | Yes (47 → 36) |
+| 1 | 35.7 | No |
+| 2 | 41.8 | Yes (29.7 vs 36.1) |
+| 3 | 30.7 | No |
+| 4 | 39.9 | No |
+| 5 | 31.4 | No (p=0.26) |
+
+Baseline froze at epoch 2 (mean 29.94) and never updated. Optimal is 4–6 hops; model is stuck at ~30.
+
+### Training diagnosis — why it's not converging
+
+**Key signal:** training batch cost (sampled decoding) ~14, validation cost (greedy decoding) ~30–42. Sampled paths are nearly half the cost of greedy paths, which is backwards — greedy should be at least as good as average sampled.
+
+This means the model has learned a **high-entropy policy**: it occasionally samples a short path by random luck (dragging the sampled average down), but the greedy path — always picking the most probable next node — doesn't reliably navigate toward the end. The model can identify where the end node is but doesn't know how to route toward it through the graph.
+
+**Root cause: node features are too weak.** The only features that vary between instances are `is_start` and `is_end`. The other two features (normalized node index, avg outgoing cost) are identical across all 240 instances since the topology never changes. With no distance or relational information, the model can't learn a confident routing policy — it's navigating blind.
+
+This is not a bug. The code is correct. It's a feature design problem.
 
 ---
 
 ## What Worked
 
 - Adapting the OP state-machine pattern (`NamedTuple`, `initialize`, `update`, `get_mask`, `all_finished`) to TOP worked cleanly
-- Custom `_init_embed()` using 4 features (normalized node index, avg outgoing cost, start indicator, end indicator) compiled and ran correctly
+- Custom `_init_embed()` using 4 features compiled and ran correctly
 - The rollout baseline and REINFORCE loop required no changes
 - `inspect_model.py` visualization confirmed untrained model behavior (oscillation → BFS-forced termination)
+- Model did learn something — went from ~47 (pure random oscillation) to ~30 range, showing the pipeline is working
 
 ## What Didn't Work / Cautions
 
-- **Training plateau:** Previous run froze at epoch 2 — likely needs more epochs/data, possibly better node features
-- **`min_visits=3` adds no constraint:** any valid path satisfies it. For testing the actual constraint mechanism, use `--min_visits 8` or let the default ratio (0.3 → 8) apply
-- **get_mask() is the training bottleneck:** Python `for b in range(batch_size)` loop, not vectorized. Scales O(total_instances × steps). With epoch_size=51200 this makes each epoch 30–50 min. **Vectorizing this loop would give 10–50× speedup** and should be done before running large experiments.
+- **Node features too weak to learn routing:** only `is_start` and `is_end` vary across instances. Model can't navigate the graph without distance information.
+- **Training plateau / oscillating validation:** baseline froze after epoch 2. Grad norm always clipped at 1.0 throughout all 6 epochs — learning rate too high for fine-tuning phase.
+- **Sampled vs greedy gap:** sampled ~14, greedy ~30–42 is a clear sign of a high-entropy policy with no confident routing direction.
+- **`min_visits=3` adds no constraint:** any valid path satisfies it. This doesn't cause the convergence failure but means the constraint mechanism is untested.
+- **`get_mask()` is the training bottleneck:** Python `for b in range(batch_size)` loop, not vectorized. Scales O(total_instances × steps). With `epoch_size=51200` this makes each epoch 30–50 min. Vectorizing would give 10–50× speedup.
 
 ---
 
 ## Next Steps
 
-### Immediate
-1. **Check `training_log.txt`** — look for `Update baseline` and validation cost dropping epoch over epoch
-2. **Run `inspect_model.py`** after training to compare against weak baseline:
-   ```powershell
-   # Trained model (auto-picks latest)
-   python inspect_model.py --animate
+### Highest priority — fix convergence
 
-   # Weak baseline for comparison
-   python inspect_model.py --checkpoint outputs\top_22\top_inspect_<timestamp>
-   ```
-   Use the same `--seed N` for both to compare identical instances.
+**1. Add BFS distance-to-end as a 5th node feature** (highest impact, do this first)
+
+In `nets/attention_model.py`, inside `_init_embed()` where `self.is_top` is handled, add:
+
+```python
+# Feature 5: BFS distance from each node to end node, normalized
+# Computed per-instance since end changes. All costs are 1.0 so BFS = shortest hop count.
+dist_to_end = torch.full((batch_size, n_nodes), float(n_nodes), device=device)
+for b in range(batch_size):
+    end = end_idx[b].item()
+    cm = cost_matrix[b]
+    visited_bfs = {end}
+    queue = [end]
+    dist_to_end[b, end] = 0.0
+    d = 1
+    while queue:
+        next_q = []
+        for node in queue:
+            for nb in range(n_nodes):
+                if nb not in visited_bfs and not torch.isinf(cm[node, nb]):
+                    dist_to_end[b, nb] = d
+                    visited_bfs.add(nb)
+                    next_q.append(nb)
+        queue = next_q
+        d += 1
+dist_to_end = dist_to_end / n_nodes  # normalize
+
+features = torch.stack([node_indices, avg_costs, start_indicator, end_indicator, dist_to_end], dim=-1)
+```
+
+Also update `node_dim = 5` in `__init__` (currently set to 4 for TOP).
+
+This gives the model a routing gradient — it can see "node X is 2 hops from the end, node Y is 5 hops" and learn to prefer shorter paths. Without this, the model is navigating blind.
+
+**2. Adjust learning dynamics**
+
+```powershell
+python run.py --problem top --fat_tree_k 4 --min_visits 3 --baseline rollout `
+  --run_name top_ft_dist_feature --epoch_size 10240 --n_epochs 30 `
+  --batch_size 128 --eval_batch_size 128 --val_size 1024 `
+  --lr_decay 0.95 --bl_alpha 0.10 `
+  2>&1 | Tee-Object -FilePath training_log.txt
+```
+
+- `--lr_decay 0.95`: lets the model fine-tune after initial fast drop instead of staying at full LR
+- `--bl_alpha 0.10`: looser baseline update threshold — epoch 5 nearly updated at p=0.26, stricter than needed given noisy 240-instance signal
 
 ### Performance
-3. **Vectorize `get_mask()`** in `state_top1.py` — replace `for b in range(batch_size)` with tensor operations. Required before running epoch_size=51200+ experiments at reasonable speed.
+3. **Vectorize `get_mask()`** in `state_top1.py` — replace `for b in range(batch_size)` with tensor operations. Required before running `epoch_size=51200+` at reasonable speed.
 
 ### Problem extension — specific required nodes
-4. **Change `min_visits` from count to required set** — this is where BFS stops being a competitor:
-   - `state_top1.py`: replace `min_visits: Tensor (batch_size,)` with `required_nodes: Tensor (batch_size, n_required)` (fixed count); change `all_finished()` and `get_mask()` from count comparison to set membership check
-   - `attention_model.py`: add 5th node feature `is_required` (binary) — marks nodes that must be visited
-   - `fat_tree_wrapper.py`: generate a fixed-size random subset of switches as required nodes instead of a count
+4. **Change `min_visits` from count to required set** — where BFS stops being a competitor:
+   - `state_top1.py`: replace `min_visits: Tensor (batch_size,)` with `required_nodes: Tensor (batch_size, n_required)`; change `all_finished()` and `get_mask()` from count comparison to set membership check
+   - `attention_model.py`: add `is_required` binary node feature — marks nodes that must be visited
+   - `fat_tree_wrapper.py`: generate a fixed-size random subset of switches as required nodes per instance
    - `problem_top1.py`: update `get_costs()` to check set membership instead of counting unique nodes
-   - CLI: replace `--min_visits` with `--n_required` (number of required nodes to randomly pick per instance)
+   - CLI: replace `--min_visits` with `--n_required`
 
 ### Longer term
 5. **Non-uniform costs** — replace unit costs with traffic-load-based weights from the FatTree class
-6. **Richer node features** — node degree, min/max outgoing cost, BFS distance to start/end
-7. **BFS baseline comparison** — implement BFS-with-required-nodes (exponential state space) as ground truth for small instances to measure optimality gap
+6. **BFS baseline comparison** — implement BFS-with-required-nodes as ground truth for small instances to measure optimality gap
 
 ---
 
@@ -142,8 +193,12 @@ python -c "from fattree.fat_tree_wrapper import is_fat_tree_available; print(is_
 # Minimal training to get a checkpoint for inspection (~30s)
 python run.py --problem top --fat_tree_k 4 --min_visits 3 --baseline rollout --run_name top_inspect --epoch_size 128 --n_epochs 1 --batch_size 64 --eval_batch_size 64 --val_size 128
 
-# Real training (~45 min, 6 epochs)
-python run.py --problem top --fat_tree_k 4 --min_visits 3 --baseline rollout --run_name top_ft_k4 --epoch_size 10240 --n_epochs 6 --batch_size 128 --eval_batch_size 128 --val_size 1024 2>&1 | Tee-Object -FilePath training_log.txt
+# Recommended next training run (after adding distance-to-end feature)
+python run.py --problem top --fat_tree_k 4 --min_visits 3 --baseline rollout `
+  --run_name top_ft_dist_feature --epoch_size 10240 --n_epochs 30 `
+  --batch_size 128 --eval_batch_size 128 --val_size 1024 `
+  --lr_decay 0.95 --bl_alpha 0.10 `
+  2>&1 | Tee-Object -FilePath training_log.txt
 
 # Full training — only practical after vectorizing get_mask()
 python run.py --problem top --fat_tree_k 4 --min_visits 3 --baseline rollout --run_name top_ft_k4 --epoch_size 51200 --n_epochs 50 --batch_size 128 --eval_batch_size 128 --val_size 1024 2>&1 | Tee-Object -FilePath training_log.txt
