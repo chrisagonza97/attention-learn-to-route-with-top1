@@ -256,6 +256,9 @@ python inspect_model.py --checkpoint outputs\top_22\top_ft_k4_<timestamp> --seed
 
 ## Known limitations
 
+### `get_mask()` is slow (not vectorized)
+
+The masking code has a Python `for b in range(batch_size)` loop that runs at every decoding step. This is the training bottleneck — it scales linearly with total instances processed, making large epoch sizes slow (~30–50 min/epoch at epoch_size=51200). Vectorizing this loop with tensor operations would give a 10–50× speedup and is the most impactful engineering task before scaling up experiments.
 
 ### `min_visits=3` adds no constraint
 
@@ -279,8 +282,11 @@ Files to change:
 - **`fat_tree_wrapper.py`**: Generate a random subset of switches as required nodes per instance.
 - **`problem_top1.py`**: Update `get_costs()` to check set membership instead of counting unique nodes.
 
+### 2. Vectorize `get_mask()`
 
-### 2. Non-uniform edge costs
+Replace the `for b in range(batch_size)` loop with batched tensor operations. Required before running epoch_size=51200+ at reasonable speed.
+
+### 3. Non-uniform edge costs
 
 Replace unit costs with traffic-load-based weights from the FatTree class, making the problem more realistic and harder for classical algorithms.
 
@@ -293,9 +299,3 @@ Replace unit costs with traffic-load-based weights from the FatTree class, makin
 | `diagnose_costs2.py` | Shows edge cost distribution, BFS shortest paths, and constrained-optimal costs for a few instances |
 | `debug.py`, `debug_state.py`, `debug_batch26.py` | Development debugging scripts, can be ignored |
 | `check_model_paths.py` | Verifies checkpoint paths load correctly |
-
----
-
-## AI coding assistant context
-
-[HANDOFF.md](HANDOFF.md) contains a denser version of this document written for use with AI coding tools (Claude, Copilot, etc.). It covers current training state, what has and hasn't worked, and the specific file changes needed for the planned next steps. Load it as context when starting a new session.

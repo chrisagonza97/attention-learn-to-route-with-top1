@@ -64,6 +64,7 @@ class AttentionModel(nn.Module):
         self.is_vrp = problem.NAME == 'cvrp' or problem.NAME == 'sdvrp'
         self.is_orienteering = problem.NAME == 'op'
         self.is_pctsp = problem.NAME == 'pctsp'
+        self.is_top = problem.NAME == 'top'  #for top1
 
         self.tanh_clipping = tanh_clipping
 
@@ -91,9 +92,12 @@ class AttentionModel(nn.Module):
             if self.is_vrp and self.allow_partial:  # Need to include the demand if split delivery allowed
                 self.project_node_step = nn.Linear(1, 3 * embedding_dim, bias=False)
         else:  # TSP
-            assert problem.NAME == "tsp", "Unsupported problem: {}".format(problem.NAME)
+            assert problem.NAME in ["tsp", "top"], "Unsupported problem: {}".format(problem.NAME)
             step_context_dim = 2 * embedding_dim  # Embedding of first and last node
-            node_dim = 2  # x, y
+            if self.is_top:
+                node_dim = 4  # node_idx, avg_cost, is_start, is_end
+            else:
+                node_dim = 2  # x, y (for TSP)
             
             # Learned input symbols for first action
             self.W_placeholder = nn.Parameter(torch.Tensor(2 * embedding_dim))
@@ -199,7 +203,46 @@ class AttentionModel(nn.Module):
         return log_p.sum(1)
 
     def _init_embed(self, input):
-
+        if self.is_top:
+            # TOP1 problem - extract features from cost matrix
+            cost_matrix = input['cost_matrix']  # (batch, n_nodes, n_nodes)
+            start_idx = input['start_idx']       # (batch,)
+            end_idx = input['end_idx']           # (batch,)
+            
+            batch_size, n_nodes, _ = cost_matrix.shape
+            device = cost_matrix.device
+            
+            # Feature 1: Normalized node index (gives positional info)
+            node_indices = torch.arange(n_nodes, device=device, dtype=torch.float)
+            node_indices = node_indices.unsqueeze(0).expand(batch_size, -1) / n_nodes
+            
+            # Feature 2: Normalized average outgoing edge cost
+            # This captures how "expensive" each node is to leave
+            cost_copy = cost_matrix.clone()
+            cost_copy[torch.isinf(cost_copy)] = 0  # Replace inf with 0 for averaging
+            finite_mask = ~torch.isinf(cost_matrix)
+            # Sum of finite costs / count of finite edges
+            sum_costs = (cost_copy * finite_mask.float()).sum(dim=-1)
+            count_finite = finite_mask.float().sum(dim=-1) + 1e-6
+            avg_costs = sum_costs / count_finite
+            # Normalize per batch
+            max_cost = avg_costs.max(dim=1, keepdim=True)[0] + 1e-6
+            avg_costs = avg_costs / max_cost
+            
+            # Feature 3: Start node indicator (binary)
+            start_indicator = torch.zeros(batch_size, n_nodes, device=device)
+            start_indicator.scatter_(1, start_idx.unsqueeze(1), 1.0)
+            
+            # Feature 4: End node indicator (binary)
+            end_indicator = torch.zeros(batch_size, n_nodes, device=device)
+            end_indicator.scatter_(1, end_idx.unsqueeze(1), 1.0)
+            
+            # Stack features: [batch, n_nodes, 4]
+            features = torch.stack([node_indices, avg_costs, start_indicator, end_indicator], dim=-1)
+            
+            # Embed through linear layer
+            return self.init_embed(features)
+    
         if self.is_vrp or self.is_orienteering or self.is_pctsp:
             if self.is_vrp:
                 features = ('demand', )

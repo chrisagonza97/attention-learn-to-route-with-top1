@@ -16,6 +16,10 @@ def get_options(args=None):
     parser.add_argument('--val_size', type=int, default=10000,
                         help='Number of instances used for reporting validation performance')
     parser.add_argument('--val_dataset', type=str, default=None, help='Dataset file to use for validation')
+    parser.add_argument('--fat_tree_k', type=int, default=None,
+                    help="Fat tree k parameter (4, 6, 8...)")
+    parser.add_argument('--min_visits', type=int, default=None,
+                    help="Minimum nodes to visit (overrides default ratio-based calculation)")
 
     # Model
     parser.add_argument('--model', default='attention', help="Model, 'attention' (default) or 'pointer'")
@@ -72,6 +76,15 @@ def get_options(args=None):
     parser.add_argument('--no_progress_bar', action='store_true', help='Disable progress bar')
 
     opts = parser.parse_args(args)
+    # Handle fat_tree_k: auto-compute graph_size and set distribution
+    if opts.fat_tree_k is not None:
+        k = opts.fat_tree_k
+        assert k % 2 == 0, "fat_tree_k must be even"
+        # Graph size = num_switches + 2 = (5k²/4) + 2
+        num_switches = (k * k) // 4 + (k * k) // 2 + (k * k) // 2
+        opts.graph_size = num_switches + 2
+        opts.data_distribution = 'fat_tree'
+        print(f"Fat tree k={k}: graph_size={opts.graph_size}, data_distribution=fat_tree")
 
     opts.use_cuda = torch.cuda.is_available() and not opts.no_cuda
     opts.run_name = "{}_{}".format(opts.run_name, time.strftime("%Y%m%dT%H%M%S"))

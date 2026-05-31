@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 
 def load_problem(name):
-    from problems import TSP, CVRP, SDVRP, OP, PCTSPDet, PCTSPStoch
+    from problems import TSP, CVRP, SDVRP, OP, PCTSPDet, PCTSPStoch, TOP
     problem = {
         'tsp': TSP,
         'cvrp': CVRP,
@@ -19,14 +19,22 @@ def load_problem(name):
         'op': OP,
         'pctsp_det': PCTSPDet,
         'pctsp_stoch': PCTSPStoch,
+        'top': TOP
+
     }.get(name, None)
     assert problem is not None, "Currently unsupported problem: {}!".format(name)
     return problem
 
 
+##def torch_load_cpu(load_path):
+##    return torch.load(load_path, map_location=lambda storage, loc: storage)  # Load on CPU
 def torch_load_cpu(load_path):
-    return torch.load(load_path, map_location=lambda storage, loc: storage)  # Load on CPU
-
+    # Explicitly allow full pickled objects (PyTorch ≥ 2.6 default changed to weights_only=True)
+    return torch.load(
+        load_path,
+        map_location=lambda storage, loc: storage,
+        weights_only=False
+    )
 
 def move_to(var, device):
     if isinstance(var, dict):
@@ -41,11 +49,19 @@ def _load_model_file(load_path, model):
     load_optimizer_state_dict = None
     print('  [*] Loading model from {}'.format(load_path))
 
+    """load_data = torch.load(
+        os.path.join(
+            os.getcwd(),
+            load_path
+        ), map_location=lambda storage, loc: storage)"""
     load_data = torch.load(
         os.path.join(
             os.getcwd(),
             load_path
-        ), map_location=lambda storage, loc: storage)
+        ),
+        map_location=lambda storage, loc: storage,
+        weights_only=False,   # IMPORTANT for PyTorch >= 2.6
+    )
 
     if isinstance(load_data, dict):
         load_optimizer_state_dict = load_data.get('optimizer', None)
